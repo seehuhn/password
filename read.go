@@ -22,69 +22,81 @@
 package password
 
 import (
+	"errors"
 	"io"
 	"os"
-	"os/signal"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
-// Read prints the given prompt to standard output and then reads a
-// line of input from standard input with echoing of input disabled.
-// This is commonly used for inputting passwords and other sensitive
-// data.  The byte slice returned does not include the terminating
-// "\n".
-func Read(prompt string) ([]byte, error) {
-	fd := 0
+var ErrKeyboardInterrupt = errors.New("keyboard interrupt")
+
+// ReadWithTimings prints the given prompt to standard output and then
+// reads a line of input from standard input with echoing of input
+// disabled.  This is commonly used for inputting passwords and other
+// sensitive data.  The byte slice returned does not include the
+// terminating "\n".
+//
+// The time of every keypress during password input is written into
+// the channel 'timings'.  This allows to use password input to gather
+// entropy for a random number generator.  Care must be taken to not
+// disclose these timings to an attacker: there is correlation between
+// keys pressed and the times between key presses.
+func ReadWithTimings(prompt string, timings chan<- time.Time) ([]byte, error) {
+	if timings != nil {
+		timings <- time.Now()
+	}
 
 	_, err := os.Stdout.Write([]byte(prompt))
 	if err != nil {
 		return nil, err
 	}
 
+	fd := 0
 	var oldState syscall.Termios
-	if _, _, err := syscall.Syscall6(syscall.SYS_IOCTL, uintptr(fd),
-		ioctlReadTermios, uintptr(unsafe.Pointer(&oldState)), 0, 0, 0); err != 0 {
+	_, _, rc := syscall.Syscall6(syscall.SYS_IOCTL, uintptr(fd),
+		ioctlReadTermios, uintptr(unsafe.Pointer(&oldState)), 0, 0, 0)
+	if rc != 0 {
 		return nil, err
 	}
 
-	newState := oldState
-	newState.Lflag &^= syscall.ECHO
-	newState.Lflag |= syscall.ICANON | syscall.ISIG
-	newState.Iflag |= syscall.ICRNL
-	if _, _, err := syscall.Syscall6(syscall.SYS_IOCTL, uintptr(fd),
-		ioctlWriteTermios, uintptr(unsafe.Pointer(&newState)), 0, 0, 0); err != 0 {
-		return nil, err
-	}
-
-	// restore terminal after keyboard interrupts
-	signalChannel := make(chan os.Signal)
-	done := make(chan bool)
-	signal.Notify(signalChannel,
-		os.Signal(syscall.SIGINT), os.Signal(syscall.SIGTERM))
-	go func() {
-		select {
-		case sig := <-signalChannel:
-			signal.Stop(signalChannel)
-			syscall.Syscall6(syscall.SYS_IOCTL, uintptr(fd),
-				ioctlWriteTermios, uintptr(unsafe.Pointer(&oldState)), 0, 0, 0)
-			p, _ := os.FindProcess(os.Getpid())
-			p.Signal(sig)
-		case <-done:
-		}
-	}()
-	defer close(done)
-
-	defer func() {
+	restore := func() {
 		syscall.Syscall6(syscall.SYS_IOCTL, uintptr(fd),
 			ioctlWriteTermios, uintptr(unsafe.Pointer(&oldState)), 0, 0, 0)
 		os.Stdout.Write([]byte("\n"))
-	}()
+	}
+	defer restore()
+
+	// Go does not allow to interrupt the syscall.Read() on interrupt;
+	// either the whole program is aborted, or the .Read() call keeps
+	// running.  On the other hand, we need to catch interrupts in
+	// order to restore the terminal settings before exiting.  To get
+	// the best of both worlds, we switch the terminal to raw mode and
+	// interpret control characters manually in the switch statement,
+	// below.  On interrupt, instead of sending a signal, we return
+	// with error code ErrKeyboardInterrupt.
+	newState := oldState
+	newState.Lflag &^= syscall.ECHO | syscall.ISIG | syscall.ICANON |
+		syscall.IEXTEN
+	newState.Iflag &^= syscall.IXON | syscall.IXOFF
+	newState.Iflag |= syscall.ICRNL
+	newState.Cc[syscall.VMIN] = 1
+	_, _, rc = syscall.Syscall6(syscall.SYS_IOCTL, uintptr(fd),
+		ioctlWriteTermios, uintptr(unsafe.Pointer(&newState)), 0, 0, 0)
+	if rc != 0 {
+		return nil, err
+	}
 
 	var ret []byte
-	var buf [16]byte
+	quote := false
+inputLoop:
 	for {
+		var buf [1]byte
 		n, err := syscall.Read(fd, buf[:])
+		if timings != nil {
+			timings <- time.Now()
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -94,13 +106,45 @@ func Read(prompt string) ([]byte, error) {
 			}
 			break
 		}
-		if buf[n-1] == '\n' {
-			n--
+		if quote {
+			quote = false
+			ret = append(ret, buf[0])
+			continue
 		}
-		ret = append(ret, buf[:n]...)
-		if n < len(buf) {
-			break
+
+		switch buf[0] {
+		case '\n', newState.Cc[syscall.VEOF], newState.Cc[syscall.VEOL],
+			newState.Cc[syscall.VEOL2]:
+			break inputLoop
+		case newState.Cc[syscall.VERASE]:
+			k := len(ret)
+			if k > 0 {
+				ret = ret[:k-1]
+			}
+		case newState.Cc[syscall.VINTR], newState.Cc[syscall.VQUIT]:
+			return nil, ErrKeyboardInterrupt
+		case newState.Cc[syscall.VKILL]:
+			ret = []byte{}
+		case newState.Cc[syscall.VLNEXT]:
+			quote = true
+		case newState.Cc[syscall.VWERASE]:
+			for len(ret) > 0 && ret[len(ret)-1] != ' ' {
+				ret = ret[:len(ret)-1]
+			}
+		case newState.Cc[syscall.VSTART], newState.Cc[syscall.VSTOP]:
+			// ignore
+		default:
+			ret = append(ret, buf[0])
 		}
 	}
 	return ret, nil
+}
+
+// Read prints the given prompt to standard output and then reads a
+// line of input from standard input with echoing of input disabled.
+// This is commonly used for inputting passwords and other sensitive
+// data.  The byte slice returned does not include the terminating
+// "\n".
+func Read(prompt string) ([]byte, error) {
+	return ReadWithTimings(prompt, nil)
 }

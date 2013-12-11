@@ -10,8 +10,8 @@ license::
     Use of this source code is governed by a BSD-style
     license that can be found in the LICENSE file.
 
-All changes to the original code are distributed under the following
-license::
+All added code and all changes to the original code are distributed
+under the following license::
 
     Copyright 2013 Jochen Voss. All rights reserved.
     Use of this source code is governed by a BSD-style
@@ -38,4 +38,4 @@ line::
 This switches of echoing of input to the terminal, prints the given
 prompt to the screen, reads input from standard input until the end of
 line, and finally restores the original terminal settings.  The byte
-slice returned does not include the terminating `\n`.
+slice returned does not include the terminating end-of-line character.
